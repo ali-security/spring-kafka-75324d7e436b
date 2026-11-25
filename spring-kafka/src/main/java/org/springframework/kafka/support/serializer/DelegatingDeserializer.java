@@ -26,6 +26,7 @@ import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Utils;
 
 import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
@@ -175,7 +176,7 @@ public class DelegatingDeserializer implements Deserializer<Object> {
 	@Override
 	public Object deserialize(String topic, Headers headers, ByteBuffer data) {
 		Deserializer<?> deserializer = getDeserializerByHeaders(headers);
-		return deserializer == null ? data : deserializer.deserialize(topic, headers, data);
+		return deserializer == null ? Utils.toNullableArray(data) : deserializer.deserialize(topic, headers, data);
 	}
 
 	private Deserializer<?> getDeserializerByHeaders(Headers headers) {
@@ -215,8 +216,7 @@ public class DelegatingDeserializer implements Deserializer<Object> {
 			this.delegates.put(key, deserializer);
 			return deserializer;
 		}
-		catch (IllegalStateException | ClassNotFoundException | LinkageError e) {
-			this.delegates.put(key, Serdes.serdeFrom(byte[].class).deserializer());
+		catch (IllegalStateException | IllegalArgumentException | ClassNotFoundException | LinkageError e) {
 			return null;
 		}
 	}
