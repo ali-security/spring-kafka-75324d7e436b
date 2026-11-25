@@ -1,10 +1,7 @@
 name: Auto Cherry-Pick
 
 on:
-  push:
-    branches:
-      - main
-      - '*.x'
+  workflow_dispatch:
 
 jobs:
   cherry-pick-commit:

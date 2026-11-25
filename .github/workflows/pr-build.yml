@@ -1,11 +1,160 @@
 name: Pull Request Build
 
 on:
-  pull_request:
-    branches:
-      - main
-      - '*.x'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector to run instead of the full check (e.g. :spring-kafka:test --tests FooTests)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
+  # Inlined from spring-io/spring-github-workflows/.github/workflows/spring-gradle-pull-request-build.yml@v3
+  # (the reusable workflow upstream calls), so the release jar can be built and uploaded in the same job.
   build-pull-request:
-    uses: spring-io/spring-github-workflows/.github/workflows/spring-gradle-pull-request-build.yml@v3
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    services:
+      # Zipkin collector for ObservationIntegrationTests' ZIPKIN_OTEL/ZIPKIN_BRAVE setups
+      # (micrometer SampleTestRunner sends spans to its default http://localhost:9411).
+      zipkin:
+        image: openzipkin/zipkin:3
+        ports:
+          - 9411:9411
+    steps:
+
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+
+      - uses: spring-io/spring-gradle-build-action@v2
+
+      - name: Record test skip reasons
+        run: |
+          cat > "$RUNNER_TEMP/skip-reasons.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  def out = new File(t.project.buildDir, 'skip-reasons.tsv')
+                  t.doFirst { out.delete() }
+                  t.afterTest { d, r ->
+                      if (r.resultType.name() == 'SKIPPED') {
+                          def msg = null
+                          try { msg = r.assumptionFailure?.details?.message } catch (Throwable ignored) { }
+                          if (!msg) { try { msg = r.exception?.message } catch (Throwable ignored) { } }
+                          if (!msg) { try { msg = r.failures?.find { true }?.details?.message } catch (Throwable ignored) { } }
+                          out << "${d.className}\t${d.displayName}\t${(msg ?: '').readLines().find { true } ?: ''}\n"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Run Pull Request Build
+        timeout-minutes: 45
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew :spring-kafka:jar ${{ inputs.test-filter }} -x checkstyleMain -x checkstyleTest --no-build-cache --no-scan --console=plain -I "$RUNNER_TEMP/skip-reasons.gradle"
+          else
+            ./gradlew check :spring-kafka:jar -x checkstyleMain -x checkstyleTest --no-build-cache --no-scan --console=plain -I "$RUNNER_TEMP/skip-reasons.gradle"
+          fi
+
+      - name: Upload spring-kafka jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-kafka-jar
+          path: spring-kafka/build/libs/spring-kafka-3.2.4.jar
+          if-no-files-found: error
+
+      - name: Capture Test Results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '*/build/reports/tests/**/*.*'
+          retention-days: 3
+
+      - name: Test results summary
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, re, xml.etree.ElementTree as ET
+          # Gradle's JUnit XML drops the JUnit Platform skip reason: use the reason the runner reported
+          # (skip-reasons.tsv, written by the init script), else the disabling annotation in the test source.
+          RUNTIME = {}
+          for tsv in glob.glob('*/build/skip-reasons.tsv'):
+              for row in open(tsv):
+                  parts = row.rstrip('\n').split('\t')
+                  if len(parts) == 3 and parts[2]:
+                      RUNTIME[(parts[0], parts[1].strip('"'))] = parts[2]
+          NOTES = {
+              'Wavefront': ' [ObservationIntegrationTests uses SampleTestRunner\'s default SampleRunnerConfig, which has no '
+                  'Wavefront server url/token and no env/property hook; Wavefront (Tanzu Observability) is a proprietary '
+                  'hosted SaaS that needs an account API token, so upstream CI skips these two setups too]',
+          }
+          NESTED_NOTE = {
+              'GlobalEmbeddedKafkaTestExecutionListenerTests': 'helper class run (and passed) through the JUnit Launcher inside '
+                  'GlobalEmbeddedKafkaTestExecutionListenerTests.testGlobalEmbeddedKafkaTestExecutionListener / '
+                  'testGlobalEmbeddedKafkaWithBrokerProperties, which set the property first; Gradle also discovers it directly without the property',
+          }
+          ANN = re.compile(r'@(Disabled\w*|Enabled\w*)\s*(\((?:[^()]|\([^()]*\))*\))?', re.S)
+          def annotations(src, decl):
+              m = re.search(decl, src)
+              if not m:
+                  return ''
+              head = src[:m.start()]
+              prev = max(head.rfind(';'), head.rfind('}'), head.rfind('{'))
+              found = ANN.findall(head[prev + 1:])
+              return ' '.join('@' + n + re.sub(r'\s+', ' ', a) for n, a in found)
+          def reason_from_source(classname, name):
+              outer, _, nested = classname.partition('$')
+              files = glob.glob('*/src/test/java/' + outer.replace('.', '/') + '.java')
+              if not files:
+                  return ''
+              src = open(files[0]).read()
+              method = name.split('(')[0].strip('"')
+              found = annotations(src, r'void\s+' + re.escape(method) + r'\s*\(')
+              if not found and nested:
+                  cls = annotations(src, r'class\s+' + re.escape(nested.split('$')[-1]) + r'\b')
+                  if cls:
+                      note = NESTED_NOTE.get(outer.split('.')[-1], '')
+                      found = 'class-level ' + cls + ('; ' + note if note else '')
+              return found
+          def reason_for(classname, name, sk):
+              msg = (sk.get('message') or (sk.text or '').strip()).splitlines()[0][:200] if (sk.get('message') or (sk.text or '').strip()) else ''
+              if not msg:
+                  key = name.strip('"')
+                  msg = RUNTIME.get((classname, key)) or next((v for (c, n), v in RUNTIME.items() if c == classname and (key.endswith(n) or n.endswith(key.split('.')[-1]))), '')
+              if msg:
+                  return msg + ''.join(note for word, note in NOTES.items() if word in msg)
+              found = reason_from_source(classname, name)
+              if not found and 'WAVEFRONT' in name:
+                  found = 'Wavefront setup aborted by SampleTestRunner.checkWavefrontAssumptions' + NOTES['Wavefront']
+              return found or 'no reason recorded'
+          modules = {}
+          skipped = []
+          for path in sorted(glob.glob('*/build/test-results/*/TEST-*.xml')):
+              module = path.split('/')[0]
+              root = ET.parse(path).getroot()
+              m = modules.setdefault(module, [0, 0, 0, 0])
+              for tc in root.iter('testcase'):
+                  m[0] += 1
+                  if tc.find('failure') is not None or tc.find('error') is not None:
+                      m[2] += 1
+                  elif tc.find('skipped') is not None:
+                      m[3] += 1
+                      sk = tc.find('skipped')
+                      reason = reason_for(tc.get('classname'), tc.get('name'), sk)
+                      skipped.append(f"{tc.get('classname')}.{tc.get('name')} -> {reason}")
+                  else:
+                      m[1] += 1
+          tot = [0, 0, 0, 0]
+          print('==================== JUNIT TEST SUMMARY ====================')
+          for module, (t, p, f, s) in sorted(modules.items()):
+              print(f'JUNIT XML TOTALS {module}: tests={t} passed={p} failed={f} skipped={s}')
+              tot = [a + b for a, b in zip(tot, (t, p, f, s))]
+          print(f'TEST SUMMARY (all modules): tests={tot[0]} passed={tot[1]} failed={tot[2]} skipped={tot[3]}')
+          print(f'SKIPPED TESTS ({len(skipped)}), each with its skip reason:')
+          for line in skipped:
+              print(f'  SKIPPED {line}')
+          print('=============================================================')

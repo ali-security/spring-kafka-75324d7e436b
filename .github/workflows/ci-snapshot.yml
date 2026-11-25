@@ -3,14 +3,6 @@ name: CI SNAPSHOT
 on:
   workflow_dispatch:
 
-  push:
-    branches:
-      - main
-      - '*.x'
-
-  schedule:
-    - cron: '0 5 * * *'
-
 concurrency:
   group: group-snapshot-for-${{ github.ref }}
   cancel-in-progress: true

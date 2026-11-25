@@ -1,13 +1,6 @@
 name: Deploy Docs
 
 on:
-  push:
-    branches:
-      - '*.x'
-      - main
-    tags:
-      - '**'
-
   workflow_dispatch:
 
 permissions:

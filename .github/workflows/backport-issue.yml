@@ -1,9 +1,7 @@
 name: Backport Issue
 
 on:
-  push:
-    branches:
-      - '*.x'
+  workflow_dispatch:
 
 jobs:
   backport-issue:

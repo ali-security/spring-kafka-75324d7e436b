@@ -252,7 +252,7 @@ configure(javaProjects) { subproject ->
 		from("${rootProject.projectDir}/src/dist") {
 			include 'notice.txt'
 			into 'META-INF'
-			expand(copyright: new Date().format('yyyy'), version: project.version)
+			expand(copyright: '2024', version: project.version)
 		}
 		from("${rootProject.projectDir}") {
 			include 'LICENSE.txt'
